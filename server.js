@@ -1,46 +1,14 @@
+// 页面操作：HTTP 路由与页面渲染（业务规则见 rules.js，记录保存见 store.js）
 import http from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { loadDb, saveDb, newId } from "./store.js";
+import { STATUS, RuleError, createScan, completeScan, editScan, evaluateStatus, holdsStation } from "./rules.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const dbPath = join(__dirname, "data", "cyanotype-negative-room.json");
 const port = Number(process.env.PORT || 3040);
-const seed = {
-  "items": [
-    {
-      "code": "CN-001",
-      "plateSize": "18x24cm",
-      "chemicalBatch": "B-0620",
-      "exposure": "8分钟",
-      "waterSource": "井水过滤",
-      "box": "蓝盒A-03",
-      "status": "冲洗中",
-      "defect": "边角显影不均",
-      "logs": [
-        {
-          "at": "2026-06-20",
-          "step": "曝光",
-          "note": "阴天补时2分钟"
-        }
-      ]
-    }
-  ]
-};
 const fields = [["code","底片编号","text"],["plateSize","玻璃板尺寸","text"],["chemicalBatch","药液批次","text"],["exposure","曝光时间","text"],["waterSource","冲洗水源","text"],["box","存放盒位","text"]];
 const stages = ["待曝光","冲洗中","待入盒","已交付"];
 const statLabels = ["待曝光","冲洗中","待入盒","已交付"];
 const extraFields = [["step","步骤"],["developStatus","显影状态"],["defect","缺陷类型"],["repair","修补记录"],["note","备注"]];
 
-async function loadDb() {
-  if (!existsSync(dbPath)) {
-    await mkdir(dirname(dbPath), { recursive: true });
-    await writeFile(dbPath, JSON.stringify(seed, null, 2));
-  }
-  return JSON.parse(await readFile(dbPath, "utf8"));
-}
-async function saveDb(db) { await writeFile(dbPath, JSON.stringify(db, null, 2)); }
 async function body(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -54,7 +22,6 @@ function html(res, text) {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(text);
 }
-function newId() { return "CN-" + Date.now(); }
 function computeStats(items) {
   const stats = Object.fromEntries(statLabels.map(label => [label, 0]));
   for (const item of items) {
@@ -66,13 +33,13 @@ function summarize(item) {
   const logCount = (item.logs || []).length + (item.tasks || []).reduce((n, t) => n + (t.logs || []).length, 0);
   return { ...item, logCount };
 }
-function page() {
+function layout(title, subtitle, nav, content) {
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>古法蓝晒底片整理室</title>
+  <title>${title}</title>
   <style>
     :root { --bg:#f1f3ef; --panel:#fff; --ink:#20241f; --muted:#687066; --line:#d4ddd0; --accent:#526f43; --warn:#9b4937; }
     * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--ink); font-family:Arial,"PingFang SC",sans-serif; }
@@ -80,17 +47,23 @@ function page() {
     h1 { margin:0; font-size:26px; } h2 { margin:0 0 12px; font-size:18px; } main { display:grid; grid-template-columns:380px 1fr; gap:22px; padding:22px 28px; }
     form,.panel,.card,.stat { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
     label { display:block; margin:10px 0 5px; color:var(--muted); font-size:13px; } input,select,textarea { width:100%; border:1px solid var(--line); border-radius:6px; padding:9px; font:inherit; background:#fff; } textarea { min-height:68px; }
-    button { border:0; border-radius:6px; background:var(--accent); color:#fff; padding:10px 13px; font-weight:700; cursor:pointer; } button.secondary { background:#69736a; }
+    button, a.navbtn { display:inline-block; text-decoration:none; border:0; border-radius:6px; background:var(--accent); color:#fff; padding:10px 13px; font-weight:700; cursor:pointer; } button.secondary, a.navbtn.secondary { background:#69736a; }
     .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:14px; } .stat strong { display:block; font-size:24px; }
     .toolbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; } .toolbar select,.toolbar input { width:auto; min-width:160px; }
-    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; } .card { display:grid; gap:8px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; } .card { display:grid; gap:8px; align-content:start; }
     .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
-    .logs { border-top:1px solid var(--line); padding-top:8px; max-height:90px; overflow:auto; } .warn { color:var(--warn); font-weight:700; }
+    .logs { border-top:1px solid var(--line); padding-top:8px; max-height:120px; overflow:auto; } .warn { color:var(--warn); font-weight:700; }
     @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} }
   </style>
 </head>
 <body>
-  <header><div><h1>古法蓝晒底片整理室</h1><div class="meta">底片任务、工艺步骤、缺陷和入盒交付</div></div><button id="reload">刷新</button></header>
+  <header><div><h1>${title}</h1><div class="meta">${subtitle}</div></div><div style="display:flex;gap:10px">${nav}</div></header>
+  ${content}
+</body>
+</html>`;
+}
+function page() {
+  const content = `
   <main>
     <section>
       <form id="createForm"><h2>新增底片</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存底片</button></form>
@@ -144,9 +117,109 @@ function page() {
     actionForm.onsubmit = async event => { event.preventDefault(); await api('/api/items/'+itemSelect.value+'/action', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(actionForm).entries())) }); actionForm.reset(); await load(); };
     document.querySelector('#statusFilter').onchange = render; document.querySelector('#search').oninput = render; document.querySelector('#reload').onclick = load;
     renderForms(); load();
-  </script>
-</body>
-</html>`;
+  </script>`;
+  return layout("古法蓝晒底片整理室", "底片任务、工艺步骤、缺陷和入盒交付", '<a class="navbtn secondary" href="/scans">数字化交付</a><button id="reload">刷新</button>', content);
+}
+function scansPage() {
+  const content = `
+  <main>
+    <section>
+      <form id="scanForm"><h2 id="scanFormTitle">登记扫描单</h2><div id="scanFields"></div><button id="scanSubmit">登记扫描单</button><button type="button" class="secondary" id="cancelEdit" style="display:none;margin-top:8px">取消修改</button></form>
+      <form id="completeForm" style="margin-top:14px"><h2>完成交付</h2><label>选择扫描单</label><select name="id" id="completeSelect" required></select><label>文件数</label><input name="fileCount" type="number" min="1" required><label>校验码</label><input name="checksum" required><label>复核人</label><input name="reviewer" required><button>提交交付</button></form>
+    </section>
+    <section>
+      <div class="stats" id="scanStats"></div>
+      <div class="panel"><h2>待复扫 / 已退回（不占工位）</h2><div class="grid" id="rescanList"></div></div>
+      <div class="panel" style="margin-top:14px"><h2>已交付</h2><div class="grid" id="deliveredList"></div></div>
+      <div class="panel" style="margin-top:14px"><h2>历次扫描</h2><div class="grid" id="historyList"></div></div>
+    </section>
+  </main>
+  <datalist id="negativeCodes"></datalist>
+  <script>
+    const scanFields = [["negativeCode","底片编号","text"],["device","扫描设备","text"],["station","工位","text"],["calibrationDate","设备校准日期","date"],["resolution","目标分辨率(dpi)","number"],["scanner","扫描人","text"]];
+    const statusList = ["进行中","待复扫","已交付","已退回"];
+    const scanForm = document.querySelector('#scanForm');
+    const completeForm = document.querySelector('#completeForm');
+    const completeSelect = document.querySelector('#completeSelect');
+    let scans = [], items = [], editingId = null;
+    async function api(path, options) {
+      const res = await fetch(path, options && options.body ? { ...options, headers:{ 'Content-Type':'application/json' } } : options);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || '请求失败');
+      return data;
+    }
+    function renderScanForm() {
+      document.querySelector('#scanFields').innerHTML = scanFields.map(([key,label,type]) => '<label>'+label+'</label><input name="'+key+'" type="'+type+'" required '+(key==='negativeCode'?'list="negativeCodes"':'')+'>').join('');
+    }
+    function setEditing(id) {
+      editingId = id;
+      document.querySelector('#scanFormTitle').textContent = id ? '修改扫描单 ' + id : '登记扫描单';
+      document.querySelector('#scanSubmit').textContent = id ? '保存修改' : '登记扫描单';
+      document.querySelector('#cancelEdit').style.display = id ? '' : 'none';
+      if (!id) scanForm.reset();
+    }
+    function baseCard(scan) {
+      return '<h3>'+scan.id+' · '+scan.negativeCode+'</h3><span class="pill">'+scan.status+'</span>'
+        + '<div><b>设备</b> '+scan.device+'</div><div><b>工位</b> '+scan.station+'</div>'
+        + '<div><b>校准日期</b> '+scan.calibrationDate+'</div><div><b>目标分辨率</b> '+scan.resolution+'</div><div><b>扫描人</b> '+scan.scanner+'</div>';
+    }
+    function historyHtml(scan) {
+      return (scan.history || []).map(h => '<div>'+String(h.at).slice(0,16).replace('T',' ')+' '+h.step+'：'+h.note+'</div>').join('') || '暂无记录';
+    }
+    function render() {
+      document.querySelector('#negativeCodes').innerHTML = items.map(i => '<option value="'+(i.code || i.id)+'">').join('');
+      const stats = Object.fromEntries(statusList.map(s => [s, scans.filter(x => x.status === s).length]));
+      document.querySelector('#scanStats').innerHTML = Object.entries(stats).map(([k,v]) => '<div class="stat"><span>'+k+'</span><strong>'+v+'</strong></div>').join('');
+      const open = scans.filter(s => s.status !== '已交付');
+      completeSelect.innerHTML = open.map(s => '<option value="'+s.id+'">'+s.id+' · '+s.negativeCode+' · '+s.status+'</option>').join('');
+      document.querySelector('#rescanList').innerHTML = scans.filter(s => s.status === '待复扫' || s.status === '已退回').map(scan => {
+        const problems = (scan.problems || []).map(p => '<div class="warn">'+p+'</div>').join('');
+        return '<article class="card">'+baseCard(scan)+problems+'<button class="secondary" data-edit="'+scan.id+'">修改</button><div class="logs meta">'+historyHtml(scan)+'</div></article>';
+      }).join('') || '<div class="meta">暂无待复扫或退回的扫描单</div>';
+      document.querySelector('#deliveredList').innerHTML = scans.filter(s => s.status === '已交付').map(scan =>
+        '<article class="card">'+baseCard(scan)+'<div><b>文件数</b> '+scan.fileCount+'</div><div><b>校验码</b> '+scan.checksum+'</div><div><b>复核人</b> '+scan.reviewer+'</div><div class="meta">完成于 '+String(scan.completedAt || '').slice(0,16).replace('T',' ')+'</div><button class="secondary" data-edit="'+scan.id+'">修改</button><div class="logs meta">'+historyHtml(scan)+'</div></article>'
+      ).join('') || '<div class="meta">暂无已交付的扫描单</div>';
+      document.querySelector('#historyList').innerHTML = scans.map(scan =>
+        '<article class="card">'+baseCard(scan)+'<div class="logs meta">'+historyHtml(scan)+'</div></article>'
+      ).join('') || '<div class="meta">暂无扫描记录</div>';
+      document.querySelectorAll('[data-edit]').forEach(btn => btn.onclick = () => {
+        const scan = scans.find(s => s.id === btn.dataset.edit);
+        if (!scan) return;
+        for (const [key] of scanFields) scanForm.elements[key].value = scan[key] ?? '';
+        setEditing(scan.id);
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      });
+    }
+    async function load() {
+      [items, scans] = await Promise.all([api('/api/items'), api('/api/scans')]);
+      render();
+    }
+    scanForm.onsubmit = async event => {
+      event.preventDefault();
+      const data = Object.fromEntries(new FormData(scanForm).entries());
+      try {
+        if (editingId) await api('/api/scans/'+editingId, { method:'PATCH', body: JSON.stringify(data) });
+        else await api('/api/scans', { method:'POST', body: JSON.stringify(data) });
+        setEditing(null);
+        await load();
+      } catch (error) { alert(error.message); }
+    };
+    document.querySelector('#cancelEdit').onclick = () => setEditing(null);
+    completeForm.onsubmit = async event => {
+      event.preventDefault();
+      const data = Object.fromEntries(new FormData(completeForm).entries());
+      const id = data.id;
+      delete data.id;
+      try {
+        await api('/api/scans/'+id+'/complete', { method:'POST', body: JSON.stringify(data) });
+        completeForm.reset();
+        await load();
+      } catch (error) { alert(error.message); await load(); }
+    };
+    document.querySelector('#reload').onclick = load;
+    renderScanForm(); load();
+  </script>`;
+  return layout("数字化交付", "扫描单登记、复扫、交付与历次扫描", '<a class="navbtn secondary" href="/">底片整理室</a><button id="reload">刷新</button>', content);
 }
 
 const server = http.createServer(async (req, res) => {
@@ -154,14 +227,62 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const db = await loadDb();
     if (req.method === "GET" && url.pathname === "/") return html(res, page());
+    if (req.method === "GET" && url.pathname === "/scans") return html(res, scansPage());
     if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
     if (req.method === "POST" && url.pathname === "/api/items") {
       const input = await body(req);
-      const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建底片" }] };
-      
+      const item = { id: newId("CN"), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建底片" }] };
+
       db.items.unshift(item);
       await saveDb(db);
       return send(res, 201, item);
+    }
+    if (req.method === "GET" && url.pathname === "/api/scans") {
+      const now = new Date();
+      return send(res, 200, db.scans.map(scan => ({
+        ...scan,
+        holdsStation: holdsStation(scan),
+        problems: scan.status === STATUS.DELIVERED ? [] : evaluateStatus(scan, now).problems,
+      })));
+    }
+    if (req.method === "POST" && url.pathname === "/api/scans") {
+      try {
+        const input = await body(req);
+        const scan = createScan(db.scans, input, newId("SC"), new Date());
+        db.scans.unshift(scan);
+        await saveDb(db);
+        return send(res, 201, scan);
+      } catch (error) {
+        if (error instanceof RuleError) return send(res, 409, { error: error.message, code: error.code });
+        throw error;
+      }
+    }
+    const scanPatch = url.pathname.match(/^\/api\/scans\/([^/]+)$/);
+    if (scanPatch && req.method === "PATCH") {
+      const scan = db.scans.find(x => x.id === scanPatch[1]);
+      if (!scan) return send(res, 404, { error: "scan_not_found" });
+      try {
+        const result = editScan(db.scans, scan, await body(req), new Date());
+        await saveDb(db);
+        return send(res, 200, { ...result.scan, invalidated: result.invalidated });
+      } catch (error) {
+        if (error instanceof RuleError) return send(res, 409, { error: error.message, code: error.code });
+        throw error;
+      }
+    }
+    const scanComplete = url.pathname.match(/^\/api\/scans\/([^/]+)\/complete$/);
+    if (scanComplete && req.method === "POST") {
+      const scan = db.scans.find(x => x.id === scanComplete[1]);
+      if (!scan) return send(res, 404, { error: "scan_not_found" });
+      try {
+        const result = completeScan(scan, await body(req), new Date());
+        await saveDb(db);
+        if (result.returned) return send(res, 409, { error: "复核人与扫描人相同，交付已退回", code: "returned" });
+        return send(res, 200, result.scan);
+      } catch (error) {
+        if (error instanceof RuleError) return send(res, 409, { error: error.message, code: error.code });
+        throw error;
+      }
     }
     const patch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
     if (patch && req.method === "PATCH") {
