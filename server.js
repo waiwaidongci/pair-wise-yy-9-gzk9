@@ -3,6 +3,9 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { scanPage } from "./scan-page.js";
+import { loadScanOrders, saveScanOrders } from "./scan-store.js";
+import { decorateOrder, registerOrder, updateOrder, completeOrder } from "./scan-rules.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = join(__dirname, "data", "cyanotype-negative-room.json");
@@ -90,7 +93,7 @@ function page() {
   </style>
 </head>
 <body>
-  <header><div><h1>古法蓝晒底片整理室</h1><div class="meta">底片任务、工艺步骤、缺陷和入盒交付</div></div><button id="reload">刷新</button></header>
+  <header><div><h1>古法蓝晒底片整理室</h1><div class="meta">底片任务、工艺步骤、缺陷和入盒交付</div></div><div style="display:flex;gap:12px;align-items:center"><a href="/scan" style="color:var(--accent);font-weight:700;text-decoration:none">数字化交付</a><button id="reload">刷新</button></div></header>
   <main>
     <section>
       <form id="createForm"><h2>新增底片</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存底片</button></form>
@@ -201,9 +204,39 @@ const server = http.createServer(async (req, res) => {
       return send(res, 201, item);
     }
     if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
+    if (req.method === "GET" && url.pathname === "/scan") return html(res, scanPage());
+    if (req.method === "GET" && url.pathname === "/api/scan-orders") {
+      const orders = await loadScanOrders();
+      return send(res, 200, orders.map(order => decorateOrder(order)));
+    }
+    if (req.method === "POST" && url.pathname === "/api/scan-orders") {
+      const orders = await loadScanOrders();
+      const order = registerOrder(await body(req), orders);
+      orders.unshift(order);
+      await saveScanOrders(orders);
+      return send(res, 201, decorateOrder(order));
+    }
+    const scanPatch = url.pathname.match(/^\/api\/scan-orders\/([^/]+)$/);
+    if (scanPatch && req.method === "PATCH") {
+      const orders = await loadScanOrders();
+      const order = orders.find(x => x.id === scanPatch[1]);
+      if (!order) return send(res, 404, { error: "scan_order_not_found" });
+      updateOrder(order, await body(req), orders);
+      await saveScanOrders(orders);
+      return send(res, 200, decorateOrder(order));
+    }
+    const scanComplete = url.pathname.match(/^\/api\/scan-orders\/([^/]+)\/complete$/);
+    if (scanComplete && req.method === "POST") {
+      const orders = await loadScanOrders();
+      const order = orders.find(x => x.id === scanComplete[1]);
+      if (!order) return send(res, 404, { error: "scan_order_not_found" });
+      const outcome = completeOrder(order, await body(req));
+      await saveScanOrders(orders);
+      return send(res, 200, { outcome, order: decorateOrder(order) });
+    }
     send(res, 404, { error: "not_found" });
   } catch (error) {
-    send(res, 500, { error: error.message });
+    send(res, error.status || 500, { error: error.message });
   }
 });
 server.listen(port, () => console.log("古法蓝晒底片整理室 listening on http://localhost:" + port));
